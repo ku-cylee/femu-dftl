@@ -2,6 +2,7 @@
 #define __FEMU_FTL_H
 
 #include "../nvme.h"
+#include "dftl.h"
 
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
@@ -200,8 +201,14 @@ struct ssd {
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
-    struct write_pointer wp;
-    struct line_mgmt lm;
+
+    #ifdef DFTL
+    struct write_pointer trans_wp;
+    struct line_mgmt trans_lm;
+    #endif
+
+    struct write_pointer data_wp;
+    struct line_mgmt data_lm;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
