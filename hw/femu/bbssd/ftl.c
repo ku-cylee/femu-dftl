@@ -999,6 +999,7 @@ static int do_gc(struct ssd *ssd, bool force)
 }
 #endif
 
+#ifdef DFTL
 static uint64_t get_addr_trans_latency(
     struct ssd *ssd,
     NvmeRequest *req,
@@ -1018,6 +1019,7 @@ static uint64_t get_addr_trans_latency(
 
     return latency;
 }
+#endif
 
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
