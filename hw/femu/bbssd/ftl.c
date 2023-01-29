@@ -1,8 +1,6 @@
 #include "ftl.h"
 #include "dftl.h"
 
-//#define FEMU_DEBUG_FTL
-
 static void *ftl_thread(void *arg);
 
 #ifdef DFTL
@@ -10,6 +8,8 @@ static inline bool mapped_ppa(struct ppa *ppa);
 static struct ppa get_new_trans_page(struct ssd *ssd);
 static inline struct nand_page *get_pg(struct ssd *ssd, struct ppa *ppa);
 static void ssd_advance_trans_write_pointer(struct ssd *ssd);
+static void mark_trans_page_invalid(struct ssd *ssd, struct ppa *ppa);
+static void mark_trans_page_valid(struct ssd *ssd, struct ppa *ppa);
 #endif
 
 #ifdef GC
@@ -30,10 +30,9 @@ static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
     return ssd->maptbl[lpn];
 }
 #else
-static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
+static struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
 {
     struct ssdparams *spp = &ssd->sp;
-
     uint64_t gtd_idx = lpn / spp->ppas_per_page;
     uint64_t offset = lpn % spp->ppas_per_page;
 
@@ -41,8 +40,6 @@ static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
     if (!mapped_ppa(trans_pg_ppa)) return *trans_pg_ppa;
 
     struct nand_page *trans_page = get_pg(ssd, trans_pg_ppa);
-    ftl_assert(trans_page->trans_data);
-
     return trans_page->trans_data[offset];
 }
 #endif
@@ -54,24 +51,34 @@ static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa
     ssd->maptbl[lpn] = *ppa;
 }
 #else
-static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
+static void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
 {
     struct ssdparams *spp = &ssd->sp;
 
     uint64_t gtd_idx = lpn / spp->ppas_per_page;
     uint64_t offset = lpn % spp->ppas_per_page;
 
-    struct ppa *trans_pg_ppa = &ssd->gtd[gtd_idx];
-    if (mapped_ppa(trans_pg_ppa)) {
-        struct nand_page *trans_page = get_pg(ssd, trans_pg_ppa);
-        trans_page->trans_data[offset] = *ppa;
+    struct ppa new_trans_ppa = get_new_trans_page(ssd);
+    struct nand_page *new_trans_page = get_pg(ssd, &new_trans_ppa);
+
+    struct ppa *orig_trans_ppa = &ssd->gtd[gtd_idx];
+    if (mapped_ppa(orig_trans_ppa)) {
+        struct nand_page *orig_trans_page = get_pg(ssd, orig_trans_ppa);
+
+        for (int i = 0; i < spp->ppas_per_page; i++) {
+            new_trans_page->trans_data[i] = (i == offset)
+                ? *ppa
+                : orig_trans_page->trans_data[i];
+        }
+        mark_trans_page_invalid(ssd, orig_trans_ppa);
     } else {
-        struct ppa new_trans_pg_ppa = get_new_trans_page(ssd);
-        struct nand_page *new_trans_page = get_pg(ssd, &new_trans_pg_ppa);
-        new_trans_page->trans_data[offset] = *ppa;
-        ssd->gtd[gtd_idx] = new_trans_pg_ppa;
-        ssd_advance_trans_write_pointer(ssd);
+        new_trans_page->trans_data[offset].ppa = ppa->ppa;
     }
+
+    mark_trans_page_valid(ssd, &new_trans_ppa);
+
+    ssd->gtd[gtd_idx] = new_trans_ppa;
+    ssd_advance_trans_write_pointer(ssd);
 }
 #endif
 
@@ -143,7 +150,7 @@ static void ssd_init_lines(
         if (blk_filter_fn(i)) lm->tt_lines++;
     }
 
-    lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
+    lm->lines = g_malloc0(sizeof(struct line) * spp->tt_lines);
 
     QTAILQ_INIT(&lm->free_line_list);
     lm->victim_line_pq = pqueue_init(lm->tt_lines, victim_line_cmp_pri,
@@ -151,11 +158,11 @@ static void ssd_init_lines(
             victim_line_get_pos, victim_line_set_pos);
     QTAILQ_INIT(&lm->full_line_list);
 
-    int line_idx = 0;
+    // int line_idx = 0;
     lm->free_line_cnt = 0;
     for (int i = 0; i < spp->tt_lines; i++) {
         if (!blk_filter_fn(i)) continue;
-        line = &lm->lines[line_idx++];
+        line = &lm->lines[i];
         line->id = i;
         line->ipc = 0;
         line->vpc = 0;
@@ -165,7 +172,7 @@ static void ssd_init_lines(
         lm->free_line_cnt++;
     }
 
-    ftl_assert(line_idx == lm->tt_lines);
+    // ftl_assert(line_idx == lm->tt_lines);
     ftl_assert(lm->free_line_cnt == lm->tt_lines);
     lm->victim_line_cnt = 0;
     lm->full_line_cnt = 0;
@@ -307,7 +314,7 @@ static void ssd_advance_write_pointer(
 #ifdef DFTL
 static void ssd_advance_trans_write_pointer(struct ssd *ssd)
 {
-    ssd_advance_write_pointer(ssd, &ssd->trans_wp, &ssd->data_lm);
+    ssd_advance_write_pointer(ssd, &ssd->trans_wp, &ssd->trans_lm);
 }
 #endif
 
