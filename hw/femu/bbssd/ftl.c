@@ -5,6 +5,13 @@
 
 static void *ftl_thread(void *arg);
 
+#ifdef DFTL
+static inline bool mapped_ppa(struct ppa *ppa);
+static struct ppa get_new_trans_page(struct ssd *ssd);
+static inline struct nand_page *get_pg(struct ssd *ssd, struct ppa *ppa);
+static void ssd_advance_trans_write_pointer(struct ssd *ssd);
+#endif
+
 #ifdef GC
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -17,16 +24,56 @@ static inline bool should_gc_high(struct ssd *ssd)
 }
 #endif
 
+#ifndef DFTL
 static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
 {
     return ssd->maptbl[lpn];
 }
+#else
+static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
+{
+    struct ssdparams *spp = &ssd->sp;
 
+    uint64_t gtd_idx = lpn / spp->ppas_per_page;
+    uint64_t offset = lpn % spp->ppas_per_page;
+
+    struct ppa *trans_pg_ppa = &ssd->gtd[gtd_idx];
+    if (!mapped_ppa(trans_pg_ppa)) return *trans_pg_ppa;
+
+    struct nand_page *trans_page = get_pg(ssd, trans_pg_ppa);
+    ftl_assert(trans_page->trans_data);
+
+    return trans_page->trans_data[offset];
+}
+#endif
+
+#ifndef DFTL
 static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
 {
     ftl_assert(lpn < ssd->sp.tt_pgs);
     ssd->maptbl[lpn] = *ppa;
 }
+#else
+static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
+{
+    struct ssdparams *spp = &ssd->sp;
+
+    uint64_t gtd_idx = lpn / spp->ppas_per_page;
+    uint64_t offset = lpn % spp->ppas_per_page;
+
+    struct ppa *trans_pg_ppa = &ssd->gtd[gtd_idx];
+    if (mapped_ppa(trans_pg_ppa)) {
+        struct nand_page *trans_page = get_pg(ssd, trans_pg_ppa);
+        trans_page->trans_data[offset] = *ppa;
+    } else {
+        struct ppa new_trans_pg_ppa = get_new_trans_page(ssd);
+        struct nand_page *new_trans_page = get_pg(ssd, &new_trans_pg_ppa);
+        new_trans_page->trans_data[offset] = *ppa;
+        ssd->gtd[gtd_idx] = new_trans_pg_ppa;
+        ssd_advance_trans_write_pointer(ssd);
+    }
+}
+#endif
 
 static uint64_t ppa2pgidx(struct ssd *ssd, struct ppa *ppa)
 {
@@ -285,12 +332,14 @@ static struct ppa get_new_page(struct write_pointer *wpp)
 }
 
 #ifdef DFTL
-static struct ppa get_new_trans_page(struct ssd *ssd) {
+static struct ppa get_new_trans_page(struct ssd *ssd)
+{
     return get_new_page(&ssd->trans_wp);
 }
 #endif
 
-static struct ppa get_new_data_page(struct ssd *ssd) {
+static struct ppa get_new_data_page(struct ssd *ssd)
+{
     return get_new_page(&ssd->data_wp);
 }
 
@@ -353,10 +402,19 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
     spp->enable_gc_delay = true;
 
+    #ifdef DFTL
+    spp->ppas_per_page = spp->secs_per_pg * spp->secsz / sizeof(struct ppa);
+    #endif
+
     check_params(spp);
 }
 
-static void ssd_init_nand_page(struct nand_page *pg, struct ssdparams *spp)
+static void ssd_init_nand_page(
+    struct nand_page *pg,
+    #ifdef DFTL
+    bool is_trans,
+    #endif
+    struct ssdparams *spp)
 {
     pg->nsecs = spp->secs_per_pg;
     pg->sec = g_malloc0(sizeof(nand_sec_status_t) * pg->nsecs);
@@ -364,14 +422,35 @@ static void ssd_init_nand_page(struct nand_page *pg, struct ssdparams *spp)
         pg->sec[i] = SEC_FREE;
     }
     pg->status = PG_FREE;
+
+    #ifdef DFTL
+    if (is_trans) {
+        pg->trans_data = g_malloc0(sizeof(struct ppa) * spp->ppas_per_page);
+        for (int i = 0; i < spp->ppas_per_page; i++) {
+            pg->trans_data[i].ppa = UNMAPPED_PPA;
+        }
+    } else {
+        pg->trans_data = NULL;
+    }
+    #endif
 }
 
-static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp)
+static void ssd_init_nand_blk(
+    struct nand_block *blk,
+    #ifdef DFTL
+    bool is_trans,
+    #endif
+    struct ssdparams *spp)
 {
     blk->npgs = spp->pgs_per_blk;
     blk->pg = g_malloc0(sizeof(struct nand_page) * blk->npgs);
     for (int i = 0; i < blk->npgs; i++) {
-        ssd_init_nand_page(&blk->pg[i], spp);
+        ssd_init_nand_page(
+            &blk->pg[i],
+            #ifdef DFTL
+            is_trans,
+            #endif
+            spp);
     }
     blk->ipc = 0;
     blk->vpc = 0;
@@ -384,7 +463,12 @@ static void ssd_init_nand_plane(struct nand_plane *pl, struct ssdparams *spp)
     pl->nblks = spp->blks_per_pl;
     pl->blk = g_malloc0(sizeof(struct nand_block) * pl->nblks);
     for (int i = 0; i < pl->nblks; i++) {
-        ssd_init_nand_blk(&pl->blk[i], spp);
+        ssd_init_nand_blk(
+            &pl->blk[i],
+            #ifdef DFTL
+            is_trans_block_num(i),
+            #endif
+            spp);
     }
 }
 
@@ -410,6 +494,17 @@ static void ssd_init_ch(struct ssd_channel *ch, struct ssdparams *spp)
     ch->busy = 0;
 }
 
+#ifdef DFTL
+static void ssd_init_gtd(struct ssd *ssd) {
+    struct ssdparams *spp = &ssd->sp;
+
+    int gtd_size = spp->tt_pgs / spp->ppas_per_page;
+    ssd->gtd = g_malloc0(sizeof(struct ppa) * gtd_size);
+    for (int i = 0; i < gtd_size; i++) {
+        ssd->gtd[i].ppa = UNMAPPED_PPA;
+    }
+}
+#else
 static void ssd_init_maptbl(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -419,6 +514,7 @@ static void ssd_init_maptbl(struct ssd *ssd)
         ssd->maptbl[i].ppa = UNMAPPED_PPA;
     }
 }
+#endif
 
 static void ssd_init_rmap(struct ssd *ssd)
 {
@@ -446,7 +542,11 @@ void ssd_init(FemuCtrl *n)
     }
 
     /* initialize maptbl */
+    #ifdef DFTL
+    ssd_init_gtd(ssd);
+    #else
     ssd_init_maptbl(ssd);
+    #endif
 
     /* initialize rmap */
     ssd_init_rmap(ssd);

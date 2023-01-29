@@ -76,6 +76,9 @@ struct nand_page {
     nand_sec_status_t *sec;
     int nsecs;
     int status;
+    #ifdef DFTL
+    struct ppa *trans_data;
+    #endif
 };
 
 struct nand_block {
@@ -155,6 +158,10 @@ struct ssdparams {
     int tt_pls;       /* total # of planes in the SSD */
 
     int tt_luns;      /* total # of LUNs in the SSD */
+
+    #ifdef DFTL
+    int ppas_per_page;
+    #endif
 };
 
 typedef struct line {
@@ -199,8 +206,14 @@ struct ssd {
     char *ssdname;
     struct ssdparams sp;
     struct ssd_channel *ch;
+    #ifndef DFTL
     struct ppa *maptbl; /* page level mapping table */
+    #endif
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
+
+    #ifdef DFTL
+    struct ppa *gtd;
+    #endif
 
     #ifdef DFTL
     struct write_pointer trans_wp;
