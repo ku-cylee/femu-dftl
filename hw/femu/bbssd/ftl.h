@@ -202,6 +202,16 @@ struct nand_cmd {
     int64_t stime; /* Coperd: request arrival time */
 };
 
+struct addr_trans_op {
+    struct ppa *ppa;
+    int nand_cmd;
+};
+
+struct addr_trans_ops {
+    int size;
+    struct addr_trans_op ops[8];
+};
+
 struct ssd {
     char *ssdname;
     struct ssdparams sp;

@@ -30,7 +30,10 @@ static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
     return ssd->maptbl[lpn];
 }
 #else
-static struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
+static struct ppa get_maptbl_ent(
+    struct ssd *ssd,
+    uint64_t lpn,
+    struct addr_trans_ops *atops)
 {
     struct ssdparams *spp = &ssd->sp;
     uint64_t gtd_idx = lpn / spp->ppas_per_page;
@@ -40,7 +43,12 @@ static struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
     if (!mapped_ppa(trans_pg_ppa)) return *trans_pg_ppa;
 
     struct nand_page *trans_page = get_pg(ssd, trans_pg_ppa);
-    return trans_page->trans_data[offset];
+    struct ppa ppa = trans_page->trans_data[offset];
+
+    atops->ops[atops->size].ppa = trans_pg_ppa;
+    atops->ops[atops->size++].nand_cmd = NAND_READ;
+
+    return ppa;
 }
 #endif
 
@@ -51,7 +59,11 @@ static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa
     ssd->maptbl[lpn] = *ppa;
 }
 #else
-static void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
+static void set_maptbl_ent(
+    struct ssd *ssd,
+    uint64_t lpn,
+    struct ppa *ppa,
+    struct addr_trans_ops *atops)
 {
     struct ssdparams *spp = &ssd->sp;
 
@@ -70,10 +82,16 @@ static void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
                 ? *ppa
                 : orig_trans_page->trans_data[i];
         }
+
+        atops->ops[atops->size].ppa = orig_trans_ppa;
+        atops->ops[atops->size++].nand_cmd = NAND_READ;
         mark_trans_page_invalid(ssd, orig_trans_ppa);
     } else {
         new_trans_page->trans_data[offset].ppa = ppa->ppa;
     }
+
+    atops->ops[atops->size].ppa = &new_trans_ppa;
+    atops->ops[atops->size++].nand_cmd = NAND_WRITE;
 
     mark_trans_page_valid(ssd, &new_trans_ppa);
 
@@ -981,6 +999,26 @@ static int do_gc(struct ssd *ssd, bool force)
 }
 #endif
 
+static uint64_t get_addr_trans_latency(
+    struct ssd *ssd,
+    NvmeRequest *req,
+    struct addr_trans_ops atops)
+{
+    uint64_t latency = 0;
+
+    for (int i = 0; i < atops.size; i++) {
+        struct addr_trans_op op = atops.ops[i];
+
+        struct nand_cmd srd;
+        srd.type = USER_IO;
+        srd.cmd = op.nand_cmd;
+        srd.stime = req->stime;
+        latency += ssd_advance_status(ssd, op.ppa, &srd);
+    }
+
+    return latency;
+}
+
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -998,7 +1036,19 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        sublat = 0;
+
+        #ifndef DFTL
         ppa = get_maptbl_ent(ssd, lpn);
+        #else
+        struct addr_trans_ops atops;
+        atops.size = 0;
+
+        ppa = get_maptbl_ent(ssd, lpn, &atops);
+
+        sublat += get_addr_trans_latency(ssd, req, atops);
+        #endif
+
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
             //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
@@ -1010,7 +1060,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         srd.type = USER_IO;
         srd.cmd = NAND_READ;
         srd.stime = req->stime;
-        sublat = ssd_advance_status(ssd, &ppa, &srd);
+        sublat += ssd_advance_status(ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
 
@@ -1043,7 +1093,17 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     #endif
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        curlat = 0;
+
+        #ifndef DFTL
         ppa = get_maptbl_ent(ssd, lpn);
+        #else
+        struct addr_trans_ops atops;
+        atops.size = 0;
+
+        ppa = get_maptbl_ent(ssd, lpn, &atops);
+        #endif
+
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
             mark_data_page_invalid(ssd, &ppa);
@@ -1053,7 +1113,13 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         /* new write */
         ppa = get_new_data_page(ssd);
         /* update maptbl */
+        #ifndef DFTL
         set_maptbl_ent(ssd, lpn, &ppa);
+        #else
+        set_maptbl_ent(ssd, lpn, &ppa, &atops);
+
+        curlat += get_addr_trans_latency(ssd, req, atops);
+        #endif
         /* update rmap */
         set_rmap_ent(ssd, lpn, &ppa);
 
@@ -1067,7 +1133,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         swr.cmd = NAND_WRITE;
         swr.stime = req->stime;
         /* get latency statistics */
-        curlat = ssd_advance_status(ssd, &ppa, &swr);
+        curlat += ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
 
