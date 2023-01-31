@@ -24,6 +24,125 @@ static inline bool should_gc_high(struct ssd *ssd)
 }
 #endif
 
+#ifdef DFTL
+static struct cmt_page *cmt_create_page(
+    uint64_t gtd_idx,
+    struct ppa *ref_data,
+    int ppas_per_page)
+{
+    struct cmt_page *cmt_page = (struct cmt_page *)g_malloc0(sizeof(struct cmt_page));
+    cmt_page->gtd_idx = gtd_idx;
+    cmt_page->is_updated = false;
+    cmt_page->data = g_malloc0(sizeof(struct ppa) * ppas_per_page);
+    for (int i = 0; i < ppas_per_page; i++) {
+        cmt_page->data[i].ppa = ref_data ? ref_data[i].ppa : UNMAPPED_PPA;
+    }
+
+    return cmt_page;
+}
+
+static void cmt_insert(
+    struct cached_mapping_table *cmt,
+    struct cmt_page *page)
+{
+    ftl_assert(cmt->pgs_cnt <= cmt->max_pgs);
+    struct cmt_page *tail = cmt->most_recently_used;
+
+    if (tail) tail->more_recently_used = page;
+    else cmt->least_recently_used = page;
+
+    page->less_recently_used = tail;
+    page->more_recently_used = NULL;
+    cmt->most_recently_used = page;
+    cmt->pgs_cnt++;
+}
+
+static struct cmt_page *cmt_pop_victim(struct cached_mapping_table *cmt)
+{
+    ftl_assert(cmt->pgs_cnt == cmt->max_pgs);
+    ftl_assert(cmt->least_recently_used);
+
+    struct cmt_page *victim = cmt->least_recently_used;
+    if (victim->more_recently_used) victim->more_recently_used->less_recently_used = NULL;
+    else cmt->most_recently_used = NULL;
+    cmt->least_recently_used = victim->more_recently_used;
+    cmt->pgs_cnt--;
+
+    return victim;
+}
+
+static bool cmt_is_full(struct cached_mapping_table *cmt)
+{
+    return cmt->pgs_cnt == cmt->max_pgs;
+}
+
+static struct cmt_page *cmt_find_by_gtd(
+    struct cached_mapping_table *cmt,
+    uint64_t gtd_idx)
+{
+    struct cmt_page *target;
+    for (target = cmt->most_recently_used;
+         target != NULL && target->gtd_idx != gtd_idx;
+         target = target->less_recently_used);
+
+    if (!target) return NULL;
+
+    if (target->less_recently_used) {
+        target->less_recently_used->more_recently_used = target->more_recently_used;
+    } else {
+        cmt->least_recently_used = target->more_recently_used;
+    }
+
+    if (target->more_recently_used) {
+        target->more_recently_used->less_recently_used = target->less_recently_used;
+    } else {
+        cmt->most_recently_used = target->less_recently_used;
+    }
+    cmt->pgs_cnt--;
+
+    cmt_insert(cmt, target);
+
+    return target;
+}
+
+static void cmt_destroy_page(struct cmt_page *page)
+{
+    g_free(page->data);
+    g_free(page);
+}
+#endif
+
+#ifdef DFTL
+static void evict_cmt_if_full(
+    struct ssd *ssd,
+    struct cached_mapping_table *cmt,
+    struct addr_trans_ops *atops)
+{
+    struct ssdparams *spp = &ssd->sp;
+
+    if (!cmt_is_full(cmt)) return;
+
+    struct cmt_page *victim = cmt_pop_victim(cmt);
+    if (victim->is_updated) {
+        struct ppa new_trans_ppa = get_new_trans_page(ssd);
+        struct nand_page *new_trans_page = get_pg(ssd, &new_trans_ppa);
+
+        for (int i = 0; i < spp->ppas_per_page; i++) {
+            new_trans_page->trans_data[i] = victim->data[i];
+        }
+
+        mark_trans_page_invalid(ssd, &ssd->gtd[victim->gtd_idx]);
+        ssd->gtd[victim->gtd_idx] = new_trans_ppa;
+        mark_trans_page_valid(ssd, &new_trans_ppa);
+        ssd_advance_trans_write_pointer(ssd);
+
+        atops->ops[atops->size].ppa = &new_trans_ppa;
+        atops->ops[atops->size++].nand_cmd = NAND_WRITE;
+    }
+    cmt_destroy_page(victim);
+}
+#endif
+
 #ifndef DFTL
 static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
 {
@@ -36,19 +155,32 @@ static struct ppa get_maptbl_ent(
     struct addr_trans_ops *atops)
 {
     struct ssdparams *spp = &ssd->sp;
+    struct cached_mapping_table *cmt = &ssd->cmt;
+
     uint64_t gtd_idx = lpn / spp->ppas_per_page;
     uint64_t offset = lpn % spp->ppas_per_page;
 
-    struct ppa *trans_pg_ppa = &ssd->gtd[gtd_idx];
-    if (!mapped_ppa(trans_pg_ppa)) return *trans_pg_ppa;
+    struct cmt_page *cached_trans_page = cmt_find_by_gtd(cmt, gtd_idx);
 
-    struct nand_page *trans_page = get_pg(ssd, trans_pg_ppa);
-    struct ppa ppa = trans_page->trans_data[offset];
+    if (!cached_trans_page) {
+        struct ppa *trans_pg_ppa = &ssd->gtd[gtd_idx];
 
-    atops->ops[atops->size].ppa = trans_pg_ppa;
-    atops->ops[atops->size++].nand_cmd = NAND_READ;
+        evict_cmt_if_full(ssd, cmt, atops);
 
-    return ppa;
+        struct ppa *ref_data = NULL;
+        if (mapped_ppa(trans_pg_ppa)) {
+            struct nand_page *npg = get_pg(ssd, trans_pg_ppa);
+            ref_data = npg->trans_data;
+            atops->ops[atops->size].ppa = trans_pg_ppa;
+            atops->ops[atops->size++].nand_cmd = NAND_READ;
+        }
+
+        cached_trans_page = cmt_create_page(gtd_idx, ref_data, spp->ppas_per_page);
+
+        cmt_insert(cmt, cached_trans_page);
+    }
+
+    return cached_trans_page->data[offset];
 }
 #endif
 
@@ -66,37 +198,33 @@ static void set_maptbl_ent(
     struct addr_trans_ops *atops)
 {
     struct ssdparams *spp = &ssd->sp;
+    struct cached_mapping_table *cmt = &ssd->cmt;
 
     uint64_t gtd_idx = lpn / spp->ppas_per_page;
     uint64_t offset = lpn % spp->ppas_per_page;
 
-    struct ppa new_trans_ppa = get_new_trans_page(ssd);
-    struct nand_page *new_trans_page = get_pg(ssd, &new_trans_ppa);
+    struct cmt_page *cached_trans_page = cmt_find_by_gtd(cmt, gtd_idx);
 
-    struct ppa *orig_trans_ppa = &ssd->gtd[gtd_idx];
-    if (mapped_ppa(orig_trans_ppa)) {
-        struct nand_page *orig_trans_page = get_pg(ssd, orig_trans_ppa);
+    if (!cached_trans_page) {
+        struct ppa *orig_trans_ppa = &ssd->gtd[gtd_idx];
 
-        for (int i = 0; i < spp->ppas_per_page; i++) {
-            new_trans_page->trans_data[i] = (i == offset)
-                ? *ppa
-                : orig_trans_page->trans_data[i];
+        evict_cmt_if_full(ssd, cmt, atops);
+
+        struct ppa *ref_data = NULL;
+        if (mapped_ppa(orig_trans_ppa)) {
+            struct nand_page *npg = get_pg(ssd, orig_trans_ppa);
+            ref_data = npg->trans_data;
+            atops->ops[atops->size].ppa = orig_trans_ppa;
+            atops->ops[atops->size++].nand_cmd = NAND_READ;
         }
 
-        atops->ops[atops->size].ppa = orig_trans_ppa;
-        atops->ops[atops->size++].nand_cmd = NAND_READ;
-        mark_trans_page_invalid(ssd, orig_trans_ppa);
-    } else {
-        new_trans_page->trans_data[offset].ppa = ppa->ppa;
+        cached_trans_page = cmt_create_page(gtd_idx, ref_data, spp->ppas_per_page);
+
+        cmt_insert(cmt, cached_trans_page);
     }
 
-    atops->ops[atops->size].ppa = &new_trans_ppa;
-    atops->ops[atops->size++].nand_cmd = NAND_WRITE;
-
-    mark_trans_page_valid(ssd, &new_trans_ppa);
-
-    ssd->gtd[gtd_idx] = new_trans_ppa;
-    ssd_advance_trans_write_pointer(ssd);
+    cached_trans_page->is_updated = true;
+    cached_trans_page->data[offset] = *ppa;
 }
 #endif
 
@@ -529,6 +657,16 @@ static void ssd_init_gtd(struct ssd *ssd) {
         ssd->gtd[i].ppa = UNMAPPED_PPA;
     }
 }
+
+static void ssd_init_cmt(struct ssd *ssd) {
+    struct ssdparams *spp = &ssd->sp;
+    struct cached_mapping_table *cmt = &ssd->cmt;
+
+    cmt->pgs_cnt = 0;
+    cmt->max_pgs = CMT_SIZE / (spp->secs_per_pg * spp->secsz);
+    cmt->least_recently_used = NULL;
+    cmt->most_recently_used = NULL;
+}
 #else
 static void ssd_init_maptbl(struct ssd *ssd)
 {
@@ -569,6 +707,7 @@ void ssd_init(FemuCtrl *n)
     /* initialize maptbl */
     #ifdef DFTL
     ssd_init_gtd(ssd);
+    ssd_init_cmt(ssd);
     #else
     ssd_init_maptbl(ssd);
     #endif

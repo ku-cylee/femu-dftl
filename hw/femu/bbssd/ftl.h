@@ -8,6 +8,11 @@
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
 
+#ifdef DFTL
+// CMT size in bytes
+#define CMT_SIZE        16 * 1024 * 1024
+#endif
+
 enum {
     NAND_READ =  0,
     NAND_WRITE = 1,
@@ -202,6 +207,7 @@ struct nand_cmd {
     int64_t stime; /* Coperd: request arrival time */
 };
 
+#ifdef DFTL
 struct addr_trans_op {
     struct ppa *ppa;
     int nand_cmd;
@@ -211,6 +217,24 @@ struct addr_trans_ops {
     int size;
     struct addr_trans_op ops[8];
 };
+#endif
+
+#ifdef DFTL
+struct cmt_page {
+    uint64_t gtd_idx;
+    bool is_updated;
+    struct ppa *data;
+    struct cmt_page *less_recently_used;    // prev
+    struct cmt_page *more_recently_used;    // next
+};
+
+struct cached_mapping_table {
+    uint64_t pgs_cnt;
+    uint64_t max_pgs;
+    struct cmt_page *least_recently_used;
+    struct cmt_page *most_recently_used;
+};
+#endif
 
 struct ssd {
     char *ssdname;
@@ -223,6 +247,7 @@ struct ssd {
 
     #ifdef DFTL
     struct ppa *gtd;
+    struct cached_mapping_table cmt;
     #endif
 
     #ifdef DFTL
