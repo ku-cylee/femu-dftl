@@ -209,13 +209,14 @@ struct nand_cmd {
 
 #ifdef DFTL
 struct addr_trans_op {
-    struct ppa *ppa;
     int nand_cmd;
+    struct ppa *ppa;
+    struct addr_trans_op *next;
 };
 
 struct addr_trans_ops {
-    int size;
-    struct addr_trans_op ops[8];
+    struct addr_trans_op *head;
+    struct addr_trans_op *tail;
 };
 #endif
 

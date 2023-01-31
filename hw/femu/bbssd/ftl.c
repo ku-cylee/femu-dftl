@@ -7,6 +7,7 @@ static void *ftl_thread(void *arg);
 static inline bool mapped_ppa(struct ppa *ppa);
 static struct ppa get_new_trans_page(struct ssd *ssd);
 static inline struct nand_page *get_pg(struct ssd *ssd, struct ppa *ppa);
+static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct nand_cmd *ncmd);
 static void ssd_advance_trans_write_pointer(struct ssd *ssd);
 static void mark_trans_page_invalid(struct ssd *ssd, struct ppa *ppa);
 static void mark_trans_page_valid(struct ssd *ssd, struct ppa *ppa);
@@ -113,6 +114,65 @@ static void cmt_destroy_page(struct cmt_page *page)
 #endif
 
 #ifdef DFTL
+static struct addr_trans_ops *atops_create(void)
+{
+    struct addr_trans_ops *atops = g_malloc0(sizeof(struct addr_trans_ops));
+    atops->head = NULL;
+    atops->tail = NULL;
+    return atops;
+}
+
+static void atops_enqueue(
+    struct addr_trans_ops *atops,
+    int nand_cmd,
+    struct ppa *ppa)
+{
+    struct addr_trans_op *op = g_malloc0(sizeof(struct addr_trans_op));
+    op->nand_cmd = nand_cmd;
+    op->ppa = ppa;
+    op->next = NULL;
+
+    struct addr_trans_op *tail = atops->tail;
+    if (tail) tail->next = op;
+    else atops->head = op;
+    atops->tail = op;
+}
+
+static void atops_destroy(struct addr_trans_ops *atops)
+{
+    struct addr_trans_op *next_op = NULL;
+    for (struct addr_trans_op *op = atops->head;
+         op != NULL;
+         op = next_op) {
+        next_op = op->next;
+        free(op);
+    }
+    free(atops);
+}
+
+static uint64_t get_addr_trans_latency(
+    struct ssd *ssd,
+    NvmeRequest *req,
+    struct addr_trans_ops *atops)
+{
+    uint64_t latency = 0;
+
+    for (struct addr_trans_op *op = atops->head;
+         op != NULL;
+         op = op->next) {
+
+        struct nand_cmd srd;
+        srd.type = USER_IO;
+        srd.cmd = op->nand_cmd;
+        srd.stime = req->stime;
+        latency += ssd_advance_status(ssd, op->ppa, &srd);
+    }
+
+    return latency;
+}
+#endif
+
+#ifdef DFTL
 static void evict_cmt_if_full(
     struct ssd *ssd,
     struct cached_mapping_table *cmt,
@@ -136,8 +196,7 @@ static void evict_cmt_if_full(
         mark_trans_page_valid(ssd, &new_trans_ppa);
         ssd_advance_trans_write_pointer(ssd);
 
-        atops->ops[atops->size].ppa = &new_trans_ppa;
-        atops->ops[atops->size++].nand_cmd = NAND_WRITE;
+        atops_enqueue(atops, NAND_WRITE, &new_trans_ppa);
     }
     cmt_destroy_page(victim);
 }
@@ -171,8 +230,7 @@ static struct ppa get_maptbl_ent(
         if (mapped_ppa(trans_pg_ppa)) {
             struct nand_page *npg = get_pg(ssd, trans_pg_ppa);
             ref_data = npg->trans_data;
-            atops->ops[atops->size].ppa = trans_pg_ppa;
-            atops->ops[atops->size++].nand_cmd = NAND_READ;
+            atops_enqueue(atops, NAND_READ, trans_pg_ppa);
         }
 
         cached_trans_page = cmt_create_page(gtd_idx, ref_data, spp->ppas_per_page);
@@ -214,8 +272,7 @@ static void set_maptbl_ent(
         if (mapped_ppa(orig_trans_ppa)) {
             struct nand_page *npg = get_pg(ssd, orig_trans_ppa);
             ref_data = npg->trans_data;
-            atops->ops[atops->size].ppa = orig_trans_ppa;
-            atops->ops[atops->size++].nand_cmd = NAND_READ;
+            atops_enqueue(atops, NAND_READ, orig_trans_ppa);
         }
 
         cached_trans_page = cmt_create_page(gtd_idx, ref_data, spp->ppas_per_page);
@@ -1138,28 +1195,6 @@ static int do_gc(struct ssd *ssd, bool force)
 }
 #endif
 
-#ifdef DFTL
-static uint64_t get_addr_trans_latency(
-    struct ssd *ssd,
-    NvmeRequest *req,
-    struct addr_trans_ops atops)
-{
-    uint64_t latency = 0;
-
-    for (int i = 0; i < atops.size; i++) {
-        struct addr_trans_op op = atops.ops[i];
-
-        struct nand_cmd srd;
-        srd.type = USER_IO;
-        srd.cmd = op.nand_cmd;
-        srd.stime = req->stime;
-        latency += ssd_advance_status(ssd, op.ppa, &srd);
-    }
-
-    return latency;
-}
-#endif
-
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -1182,12 +1217,12 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         #ifndef DFTL
         ppa = get_maptbl_ent(ssd, lpn);
         #else
-        struct addr_trans_ops atops;
-        atops.size = 0;
+        struct addr_trans_ops *atops = atops_create();
 
-        ppa = get_maptbl_ent(ssd, lpn, &atops);
+        ppa = get_maptbl_ent(ssd, lpn, atops);
 
         sublat += get_addr_trans_latency(ssd, req, atops);
+        atops_destroy(atops);
         #endif
 
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
@@ -1239,10 +1274,9 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         #ifndef DFTL
         ppa = get_maptbl_ent(ssd, lpn);
         #else
-        struct addr_trans_ops atops;
-        atops.size = 0;
+        struct addr_trans_ops *atops = atops_create();
 
-        ppa = get_maptbl_ent(ssd, lpn, &atops);
+        ppa = get_maptbl_ent(ssd, lpn, atops);
         #endif
 
         if (mapped_ppa(&ppa)) {
@@ -1257,9 +1291,10 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         #ifndef DFTL
         set_maptbl_ent(ssd, lpn, &ppa);
         #else
-        set_maptbl_ent(ssd, lpn, &ppa, &atops);
+        set_maptbl_ent(ssd, lpn, &ppa, atops);
 
         curlat += get_addr_trans_latency(ssd, req, atops);
+        atops_destroy(atops);
         #endif
         /* update rmap */
         set_rmap_ent(ssd, lpn, &ppa);
@@ -1343,4 +1378,3 @@ static void *ftl_thread(void *arg)
 
     return NULL;
 }
-
