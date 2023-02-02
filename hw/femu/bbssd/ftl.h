@@ -171,8 +171,7 @@ struct ssdparams {
 };
 
 typedef struct line {
-    int id;
-    int blk;
+    int id;  /* line id, the same as corresponding block id */
     int ipc; /* invalid page count in this line */
     int vpc; /* valid page count in this line */
     QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */

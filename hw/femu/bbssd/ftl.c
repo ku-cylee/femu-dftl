@@ -31,7 +31,7 @@ static struct cmt_page *cmt_create_page(
     struct ppa *ref_data,
     int ppas_per_page)
 {
-    struct cmt_page *cmt_page = g_malloc0(sizeof(struct cmt_page));
+    struct cmt_page *cmt_page = (struct cmt_page *)g_malloc0(sizeof(struct cmt_page));
     cmt_page->gtd_idx = gtd_idx;
     cmt_page->is_updated = false;
     cmt_page->data = g_malloc0(sizeof(struct ppa) * ppas_per_page);
@@ -381,7 +381,7 @@ static void ssd_init_lines(
         if (blk_filter_fn(i)) lm->tt_lines++;
     }
 
-    lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
+    lm->lines = g_malloc0(sizeof(struct line) * spp->tt_lines);
 
     QTAILQ_INIT(&lm->free_line_list);
     lm->victim_line_pq = pqueue_init(lm->tt_lines, victim_line_cmp_pri,
@@ -389,13 +389,12 @@ static void ssd_init_lines(
             victim_line_get_pos, victim_line_set_pos);
     QTAILQ_INIT(&lm->full_line_list);
 
-    int line_idx = 0;
+    // int line_idx = 0;
     lm->free_line_cnt = 0;
     for (int i = 0; i < spp->tt_lines; i++) {
         if (!blk_filter_fn(i)) continue;
-        line = &lm->lines[line_idx];
-        line->id = line_idx++;
-        line->blk = i;
+        line = &lm->lines[i];
+        line->id = i;
         line->ipc = 0;
         line->vpc = 0;
         line->pos = 0;
@@ -404,7 +403,7 @@ static void ssd_init_lines(
         lm->free_line_cnt++;
     }
 
-    ftl_assert(line_idx == lm->tt_lines);
+    // ftl_assert(line_idx == lm->tt_lines);
     ftl_assert(lm->free_line_cnt == lm->tt_lines);
     lm->victim_line_cnt = 0;
     lm->full_line_cnt = 0;
@@ -450,7 +449,7 @@ static void ssd_init_write_pointer(
     wpp->ch = 0;
     wpp->lun = 0;
     wpp->pg = 0;
-    wpp->blk = curline->blk;
+    wpp->blk = curline->id;
     wpp->pl = 0;
 }
 
@@ -530,7 +529,7 @@ static void ssd_advance_write_pointer(
                     /* TODO */
                     abort();
                 }
-                wpp->blk = wpp->curline->blk;
+                wpp->blk = wpp->curline->id;
                 check_addr(wpp->blk, spp->blks_per_pl);
                 /* make sure we are starting from page 0 in the super block */
                 ftl_assert(wpp->pg == 0);
