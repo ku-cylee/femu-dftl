@@ -10,7 +10,8 @@
 
 #ifdef DFTL
 // CMT size in bytes
-#define CMT_SIZE        16 * 1024 * 1024
+#define CMT_SIZE            16 * 1024 * 1024
+#define CMT_HASH_DIV_FACTOR 64
 #endif
 
 enum {
@@ -225,6 +226,8 @@ struct cmt_page {
     uint64_t gtd_idx;
     bool is_updated;
     struct ppa *data;
+    struct cmt_page *hash_prev;
+    struct cmt_page *hash_next;
     struct cmt_page *less_recently_used;    // prev
     struct cmt_page *more_recently_used;    // next
 };
@@ -232,8 +235,10 @@ struct cmt_page {
 struct cached_mapping_table {
     uint64_t pgs_cnt;
     uint64_t max_pgs;
+    uint64_t hash_tbl_size;
     struct cmt_page *least_recently_used;
     struct cmt_page *most_recently_used;
+    struct cmt_page **hash_table;
 };
 #endif
 

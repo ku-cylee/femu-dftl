@@ -38,6 +38,10 @@ static struct cmt_page *cmt_create_page(
     for (int i = 0; i < ppas_per_page; i++) {
         cmt_page->data[i].ppa = ref_data ? ref_data[i].ppa : UNMAPPED_PPA;
     }
+    cmt_page->hash_prev = NULL;
+    cmt_page->hash_next = NULL;
+    cmt_page->less_recently_used = NULL;
+    cmt_page->more_recently_used = NULL;
 
     return cmt_page;
 }
@@ -47,14 +51,22 @@ static void cmt_insert(
     struct cmt_page *page)
 {
     ftl_assert(cmt->pgs_cnt <= cmt->max_pgs);
-    struct cmt_page *tail = cmt->most_recently_used;
+    struct cmt_page *most_recently_used = cmt->most_recently_used;
 
-    if (tail) tail->more_recently_used = page;
+    if (most_recently_used) most_recently_used->more_recently_used = page;
     else cmt->least_recently_used = page;
 
-    page->less_recently_used = tail;
+    page->less_recently_used = most_recently_used;
     page->more_recently_used = NULL;
     cmt->most_recently_used = page;
+
+    uint64_t hash_index = page->gtd_idx % cmt->hash_tbl_size;
+    struct cmt_page *hash_head = cmt->hash_table[hash_index];
+    if (hash_head) hash_head->hash_prev = page;
+    page->hash_prev = NULL;
+    page->hash_next = hash_head;
+    cmt->hash_table[hash_index] = page;
+
     cmt->pgs_cnt++;
 }
 
@@ -64,9 +76,17 @@ static struct cmt_page *cmt_pop_victim(struct cached_mapping_table *cmt)
     ftl_assert(cmt->least_recently_used);
 
     struct cmt_page *victim = cmt->least_recently_used;
+
     if (victim->more_recently_used) victim->more_recently_used->less_recently_used = NULL;
     else cmt->most_recently_used = NULL;
     cmt->least_recently_used = victim->more_recently_used;
+
+    uint64_t hash_index = victim->gtd_idx % cmt->hash_tbl_size;
+    if (victim->hash_prev) victim->hash_prev->hash_next = victim->hash_next;
+    else cmt->hash_table[hash_index] = victim->hash_next;
+
+    if (victim->hash_next) victim->hash_next->hash_prev = victim->hash_prev;
+
     cmt->pgs_cnt--;
 
     return victim;
@@ -81,10 +101,12 @@ static struct cmt_page *cmt_find_by_gtd(
     struct cached_mapping_table *cmt,
     uint64_t gtd_idx)
 {
+    uint64_t hash_index = gtd_idx % cmt->hash_tbl_size;
+
     struct cmt_page *target;
-    for (target = cmt->most_recently_used;
+    for (target = cmt->hash_table[hash_index];
          target != NULL && target->gtd_idx != gtd_idx;
-         target = target->less_recently_used);
+         target = target->hash_next);
 
     if (!target) return NULL;
 
@@ -99,6 +121,12 @@ static struct cmt_page *cmt_find_by_gtd(
     } else {
         cmt->most_recently_used = target->less_recently_used;
     }
+
+    if (target->hash_prev) target->hash_prev->hash_next = target->hash_next;
+    else cmt->hash_table[hash_index] = target->hash_next;
+
+    if (target->hash_next) target->hash_next->hash_prev = target->hash_prev;
+
     cmt->pgs_cnt--;
 
     cmt_insert(cmt, target);
@@ -721,8 +749,13 @@ static void ssd_init_cmt(struct ssd *ssd) {
 
     cmt->pgs_cnt = 0;
     cmt->max_pgs = CMT_SIZE / (spp->secs_per_pg * spp->secsz);
+    cmt->hash_tbl_size = cmt->max_pgs / CMT_HASH_DIV_FACTOR;
     cmt->least_recently_used = NULL;
     cmt->most_recently_used = NULL;
+    cmt->hash_table = g_malloc0(sizeof(struct cmt_page *) * cmt->hash_tbl_size);
+    for (int i = 0; i < cmt->hash_tbl_size; i++) {
+        cmt->hash_table[i] = NULL;
+    }
 }
 #else
 static void ssd_init_maptbl(struct ssd *ssd)
