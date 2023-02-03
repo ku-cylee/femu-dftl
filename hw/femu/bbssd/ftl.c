@@ -31,7 +31,7 @@ static struct cmt_page *cmt_create_page(
     struct ppa *ref_data,
     int ppas_per_page)
 {
-    struct cmt_page *cmt_page = (struct cmt_page *)g_malloc0(sizeof(struct cmt_page));
+    struct cmt_page *cmt_page = g_malloc0(sizeof(struct cmt_page));
     cmt_page->gtd_idx = gtd_idx;
     cmt_page->is_updated = false;
     cmt_page->data = g_malloc0(sizeof(struct ppa) * ppas_per_page);
