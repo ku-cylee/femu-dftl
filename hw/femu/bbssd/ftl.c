@@ -219,7 +219,10 @@ static void evict_cmt_if_full(
             new_trans_page->trans_data[i] = victim->data[i];
         }
 
-        mark_trans_page_invalid(ssd, &ssd->gtd[victim->gtd_idx]);
+        struct ppa *orig_trans_ppa = &ssd->gtd[victim->gtd_idx];
+        if (mapped_ppa(orig_trans_ppa)) {
+            mark_trans_page_invalid(ssd, orig_trans_ppa);
+        }
         ssd->gtd[victim->gtd_idx] = new_trans_ppa;
         mark_trans_page_valid(ssd, &new_trans_ppa);
         ssd_advance_trans_write_pointer(ssd);
